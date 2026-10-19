@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
@@ -487,5 +486,169 @@ mod tests {
             q_stored,
             "elem 0 must use re-widened stored d (nibble {q_stored})"
         );
+    }
+}
+
+// ─── E4M3 (FP8) quantization, Q8F16 block layout ─────────────────────────────
+
+/// Encode a finite f32 into OCP FP8 E4M3 bits (4-bit exponent bias 7, 3-bit
+/// mantissa, max 448, no inf/nan). Round-to-nearest-even in the normal and
+/// subnormal range; magnitudes above 464 saturate to 448 (E=15,M=6; E=15,M=7
+/// is the NaN pattern and is never emitted).
+pub(crate) fn f32_to_e4m3(x: f32) -> u8 {
+    let sign = ((x.to_bits() >> 31) as u8) << 7;
+    let a = x.abs();
+    if !a.is_finite() {
+        return sign | 0x7E; // map inf/nan input to 448 (saturate)
+    }
+    // Subnormals: E=0, value = M * 2^-9 (M in 0..=7). Rounding can reach M=8,
+    // which is the smallest normal (E=1,M=0 = 8x2^-9 = 2^-6) -- RNE across the
+    // subnormal boundary must promote, not clamp.
+    if a < 2f32.powi(-6) {
+        let m = (a / 2f32.powi(-9)).round_ties_even();
+        if m >= 8.0 {
+            return sign | (1 << 3);
+        }
+        return sign | m as u8;
+    }
+    // Normal top bucket: E=15 (values 256 + 32*M, M 0..=6 => 256..448).
+    if a >= 256.0 {
+        let m = ((a - 256.0) / 32.0).round_ties_even().min(6.0);
+        return sign | (15 << 3) | m as u8;
+    }
+    // Normal body: a in [2^-6, 256): unbiased exp e in [-6, 7], E = e+7 in [1,14].
+    let e = a.log2().floor() as i32;
+    let m_raw = (a * 2f32.powi(-e) - 1.0) * 8.0;
+    let mut m = m_raw.round_ties_even() as i32;
+    let mut e4 = e + 7;
+    if m == 8 {
+        m = 0;
+        e4 += 1;
+    }
+    // Rollover at a 2^k boundary can reach E=15,M=0 (=256) from a<256; that is a
+    // valid code. E15 M7 (NaN pattern) is unreachable: it needs m==7 with e4==15
+    // and the >=256 branch above clamps m to 6.
+    debug_assert!(
+        ((1..=14).contains(&e4) && (0..=7).contains(&m)) || (e4 == 15 && m == 0),
+        "e4m3 range bug: {x}"
+    );
+    sign | ((e4 as u8) << 3) | m as u8
+}
+
+/// Quantize F32 weights to E4M3 with per-32-group f16 scale, byte-identical
+/// block layout to quantize_q8f16: [f16 scale (2B)][32 code bytes] per group,
+/// scale = max_abs / 448 so the group max maps to exactly 448.
+pub(crate) fn quantize_e4m3f16(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 32usize;
+    let block_bytes = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+        let max_abs = group.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let scale = if max_abs == 0.0 { 0.0 } else { max_abs / 448.0 };
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        for i in 0..32 {
+            let val = if start + i < end { group[i] } else { 0.0 };
+            output[out_off + 2 + i] = f32_to_e4m3(val * inv);
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod e4m3_tests {
+    use super::*;
+    use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
+
+    /// Exact E4M3 code -> f32 decode (table-free reference).
+    fn e4m3_to_f32(byte: u8) -> f32 {
+        let s = if byte >> 7 == 1 { -1.0f32 } else { 1.0 };
+        let e4 = ((byte >> 3) & 0xF) as i32;
+        let m = (byte & 7) as i32;
+        if e4 == 0 {
+            s * m as f32 * 2f32.powi(-9)
+        } else {
+            s * 2f32.powi(e4 - 7) * (1.0 + m as f32 / 8.0)
+        }
+    }
+
+    #[test]
+    fn e4m3_special_points() {
+        assert_eq!(f32_to_e4m3(0.0) & 0x7F, 0);
+        assert_eq!(f32_to_e4m3(448.0) & 0x7F, (15 << 3) | 6);
+        assert_eq!(f32_to_e4m3(500.0) & 0x7F, (15 << 3) | 6);
+        assert_eq!(f32_to_e4m3(464.5) & 0x7F, (15 << 3) | 6);
+        assert_eq!(f32_to_e4m3(256.0) & 0x7F, (15 << 3) | 0);
+        assert_eq!(f32_to_e4m3(2f32.powi(-6)) & 0x7F, (1 << 3) | 0);
+        assert_eq!(f32_to_e4m3(2f32.powi(-9) / 2.0 - 1e-12) & 0x7F, 0);
+        assert_eq!(f32_to_e4m3(3.0 * 2f32.powi(-9)) & 0x7F, 3);
+        assert_eq!(f32_to_e4m3(-448.0), 0x80 | (15 << 3) | 6);
+    }
+
+    #[test]
+    fn e4m3_roundtrip_error_bound() {
+        let rng = |i: usize| -> f32 {
+            let t = (i as f32 * 0.00173) % 1.0;
+            let e = ((i % 24) as i32) - 12;
+            (t * 1.9 + 0.05) * 2f32.powi(e)
+        };
+        for i in 0..20000usize {
+            let x = rng(i) * if i % 3 == 0 { -1.0 } else { 1.0 };
+            let d = e4m3_to_f32(f32_to_e4m3(x));
+            let ax = x.abs();
+            if ax > 464.0 {
+                assert_eq!(d.abs(), 448.0, "saturate failed for {x}");
+                assert_eq!(d.signum(), x.signum(), "sign lost for {x}");
+                continue;
+            }
+            let bound = if ax < 2f32.powi(-6) {
+                2f32.powi(-10) + 1e-9
+            } else if ax >= 448.0 {
+                (448.0 - ax.abs()).abs() + 1.0
+            } else {
+                2f32.powi(ax.log2().floor() as i32) * 0.0625 + 1e-6
+            };
+            assert!((d - x).abs() <= bound, "x={x} d={d} bound={bound}");
+            assert_eq!(d.signum(), x.signum(), "sign lost for {x}");
+        }
+    }
+
+    #[test]
+    fn e4m3f16_block_matches_q8f16_layout() {
+        let n = 96;
+        let w: Vec<f32> = (0..n).map(|i| ((i as f32) - 47.0) * 0.13).collect();
+        let q = quantize_e4m3f16(&w);
+        assert_eq!(q.len(), 3 * 34);
+        let max_abs = w[0..32].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let s = f16_to_f32(u16::from_le_bytes([q[0], q[1]]));
+        assert!(
+            (s - max_abs / 448.0).abs() <= s * 6e-4,
+            "f16 scale rounding: {s}"
+        );
+        let zeros = quantize_e4m3f16(&vec![0.0f32; 64]);
+        assert!(zeros.chunks(34).all(|b| b.iter().all(|&x| x == 0)));
+    }
+
+    /// The compressed vision containers must keep the block stride the vision
+    /// GEMM budgets for: `m * (k / 32) * 34` bytes. Q8F16 (qt=3) and E4M3F16
+    /// (qt=27) are size-identical by construction, so one loader size check and
+    /// one GEMM budget cover both.
+    #[test]
+    fn compressed_vision_containers_use_34_byte_blocks() {
+        for k in [32usize, 64, 1152, 2560, 4608] {
+            assert!(k % 32 == 0);
+            let w: Vec<f32> = (0..k).map(|i| (i as f32).sin()).collect();
+            let q8 = quantize_q8f16(&w);
+            let e4 = quantize_e4m3f16(&w);
+            assert_eq!(q8.len(), (k / 32) * 34, "Q8F16 block stride for k={k}");
+            assert_eq!(e4.len(), (k / 32) * 34, "E4M3F16 block stride for k={k}");
+            assert_eq!(q8.len(), e4.len(), "containers must be size-identical");
+        }
     }
 }

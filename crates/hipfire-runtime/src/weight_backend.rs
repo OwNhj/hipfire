@@ -562,6 +562,10 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         dtype: DType::Q8_0,
     },
     RawCodec {
+        quant_type: 27,
+        dtype: DType::E4M3F16,
+    },
+    RawCodec {
         quant_type: 4,
         dtype: DType::Q4K,
     },
@@ -1222,21 +1226,31 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             let mut out = Vec::with_capacity(n_groups * 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let h16 = |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
+                let h16 =
+                    |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
                 // qt45: [0..2) s, [2..4) z for BOTH halves. Others: per-half s/z.
                 let (s0, z0) = (h16(0), h16(2));
-                let (s1, z1) = if quant_type == 45 { (s0, z0) } else { (h16(4), h16(6)) };
+                let (s1, z1) = if quant_type == 45 {
+                    (s0, z0)
+                } else {
+                    (h16(4), h16(6))
+                };
                 let start = out.len();
                 for i in 0..256 {
                     let p = off + 8;
                     let code = match quant_type {
                         45 => {
                             let b = data[p + i / 2] as u32;
-                            if i % 2 == 0 { b & 0xF } else { b >> 4 }
+                            if i % 2 == 0 {
+                                b & 0xF
+                            } else {
+                                b >> 4
+                            }
                         }
                         47 => {
                             let bo = p + (i / 4) * 3;
-                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            let (b0, b1, b2) =
+                                (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
                             [
                                 b0 & 0x3F,
                                 ((b0 >> 6) | (b1 << 2)) & 0x3F,
@@ -1266,7 +1280,8 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
                         }
                         49 => {
                             let bo = p + (i / 8) * 3;
-                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            let (b0, b1, b2) =
+                                (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
                             [
                                 b0 & 7,
                                 (b0 >> 3) & 7,

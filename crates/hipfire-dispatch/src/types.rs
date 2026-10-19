@@ -547,16 +547,16 @@ pub enum KernelKey {
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     AttnBf16KvBatchedMaskedWindowed, // sliding-window batched BF16 (maple prefill)
     // Native fp8 E4M3 KV (gfx1201-only; see attention_table registrations).
-    AttnFp8E4m3Kv, // scalar decode / per-token fallback (Q0 format gate)
-    AttnFlashFp8E4m3, // flash tile decode
+    AttnFp8E4m3Kv,              // scalar decode / per-token fallback (Q0 format gate)
+    AttnFlashFp8E4m3,           // flash tile decode
     AttnFp8E4m3KvBatchedMasked, // batched prefill / tree-verify
     // Flat-BF16 KV for non-windowed (Qwen dense) caches. Maple keeps the
     // windowed keys above. `AttnBf16Kv{,_BatchedMasked}` lower to F's NEW
     // native bf16 kernels `attention_bf16_kv{,_batched}` (HIPFIRE_KV_BF16=1
     // in attention_q8_0_kv{,_batched}.hip); only `AttnFlashBf16` reuses the
     // existing `attention_flash_bf16_windowed` launcher with window=0.
-    AttnBf16Kv, // scalar decode; launches attention_bf16_kv
-    AttnFlashBf16, // flash tile decode via attention_flash_bf16_windowed, window=0
+    AttnBf16Kv,              // scalar decode; launches attention_bf16_kv
+    AttnFlashBf16,           // flash tile decode via attention_flash_bf16_windowed, window=0
     AttnBf16KvBatchedMasked, // batched prefill / tree-verify; launches attention_bf16_kv_batched
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
@@ -962,7 +962,12 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            // E4M3F16 shares Q8_0's block stride; only the vision GEMM reads
+            // it today, and that GEMM is guarded by its own feature flag, so
+            // the arch predicate stays Always like Q8_0.
+            F32 | F16 | BF16 | Q8_0 | E4M3F16 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => {
+                ArchPredicate::Always
+            }
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)

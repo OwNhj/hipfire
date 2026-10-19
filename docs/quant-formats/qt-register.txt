@@ -62,6 +62,10 @@
 21  HFP4G32       passthrough
 22  TidI32        non-weight   index tensor (tid2eid), never a quantized weight
 24  MFP4G32       passthrough
+27  E4M3F16      passthrough  E4M3 (FP8) codes + f16 scale per 32; same
+                             block stride as Q8F16 (qt 3). Vision-tower
+                             weight container from
+                             `hipfire-quantize --vision-quant f8`.
 28  PARO4G128     arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
 29  PARO4G128T    arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
 30  MQ4G256Lloyd  passthrough

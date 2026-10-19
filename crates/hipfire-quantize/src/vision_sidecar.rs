@@ -50,6 +50,74 @@ pub enum VisionDtype {
     /// F32 (qt=2, lossless widen from BF16/F16 source). The loader's
     /// `load_f32_*` arms read these directly; `load_f16_gpu` would narrow.
     F32Vector,
+    /// Weight matrix stored as Q8F16 (qt=3): int8 codes + f16 scale per 32.
+    /// 1.0625 B/w resident; the vision GEMM expands the block on the fly.
+    Q8Matrix,
+    /// Weight matrix stored as E4M3 (qt=27, `E4M3F16`): same 34 B/32 block
+    /// shape as Q8F16 but FP8 codes, for the FP8-WMMA path.
+    E4M3Matrix,
+}
+
+/// Requested vision weight encoding (`--vision-quant`).
+///
+/// `F16` is the historical behavior and the default; `I8`/`F8` switch weight
+/// matrices to a compressed container (vectors always stay F32), and `Mixed`
+/// keeps the sensitive ends of the tower (patch embedding, merger) at F16
+/// while compressing the transformer body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionQuant {
+    F16,
+    I8,
+    F8,
+    Mixed,
+}
+
+impl VisionQuant {
+    /// Parse the `--vision-quant` value. Empty string is `F16`.
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "" | "f16" | "bf16" => Ok(Self::F16),
+            "i8" | "q8" | "q8f16" => Ok(Self::I8),
+            "f8" | "e4m3" | "fp8" => Ok(Self::F8),
+            "mixed" => Ok(Self::Mixed),
+            other => Err(format!(
+                "--vision-quant {other:?}: expected f16, i8, f8 or mixed"
+            )),
+        }
+    }
+
+    /// Whether a weight matrix of this name gets compressed.
+    ///
+    /// The ends of the tower stay F16: `patch_embed.proj` reads raw pixels and
+    /// `merger` writes the tokens the language model consumes, so quantizing
+    /// either one costs more accuracy than it saves bytes. The same rule the
+    /// body recipe uses for the lm-head keeps them wide.
+    fn compresses(self, name: &str) -> bool {
+        match self {
+            Self::F16 => false,
+            // i8/f8 compress every weight matrix, tower ends included.
+            Self::I8 | Self::F8 => true,
+            // mixed keeps the ends wide and compresses the transformer body.
+            Self::Mixed => !(name.contains(".patch_embed.") || name.contains(".merger")),
+        }
+    }
+
+    fn matrix_dtype(self) -> VisionDtype {
+        match self {
+            Self::F8 => VisionDtype::E4M3Matrix,
+            _ => VisionDtype::Q8Matrix,
+        }
+    }
+}
+
+/// Tensor encoding under an explicit `--vision-quant` policy. `None` when the
+/// name is outside the vision group (text tensors take the normal path).
+pub fn vision_dtype_for(name: &str, ndim: usize, quant: VisionQuant) -> Option<VisionDtype> {
+    let base = vision_dtype(name, ndim)?;
+    if base == VisionDtype::F32Vector || !quant.compresses(name) {
+        return Some(base);
+    }
+    Some(quant.matrix_dtype())
 }
 
 /// Container for a vision-group tensor, or `None` when `name` is outside
@@ -71,6 +139,15 @@ pub fn vision_dtype(name: &str, ndim: usize) -> Option<VisionDtype> {
     } else {
         VisionDtype::F16Matrix
     })
+}
+
+/// Effective encoding for a tensor under `--vision-quant`, resolving the
+/// historical default (no flag) to F16.
+pub fn vision_dtype_resolved(name: &str, ndim: usize, raw: &str) -> Option<VisionDtype> {
+    match VisionQuant::parse(raw) {
+        Ok(q) => vision_dtype_for(name, ndim, q),
+        Err(_) => vision_dtype(name, ndim),
+    }
 }
 
 /// `--include-prefix` gate: when set, only tensors under the prefix are
@@ -171,6 +248,11 @@ mod tests {
             match vision_dtype(name, *ndim) {
                 Some(VisionDtype::F16Matrix) => f16 += 1,
                 Some(VisionDtype::F32Vector) => f32 += 1,
+                // The default policy never selects a compressed container;
+                // these arms exist so adding one is a compile-time decision.
+                Some(VisionDtype::Q8Matrix) | Some(VisionDtype::E4M3Matrix) => {
+                    panic!("{name}: default vision_dtype must stay F16/F32")
+                }
                 None => panic!("{name} must have a vision dtype"),
             }
         }
@@ -231,6 +313,75 @@ mod tests {
         assert_eq!(
             resolve_vision_prefix(Some("model.visual."), false),
             Some("model.visual.")
+        );
+    }
+
+    #[test]
+    fn vision_quant_parsing_and_policy() {
+        assert_eq!(VisionQuant::parse("").unwrap(), VisionQuant::F16);
+        assert_eq!(VisionQuant::parse("F16").unwrap(), VisionQuant::F16);
+        assert_eq!(VisionQuant::parse("i8").unwrap(), VisionQuant::I8);
+        assert_eq!(VisionQuant::parse("q8f16").unwrap(), VisionQuant::I8);
+        assert_eq!(VisionQuant::parse("f8").unwrap(), VisionQuant::F8);
+        assert_eq!(VisionQuant::parse("e4m3").unwrap(), VisionQuant::F8);
+        assert_eq!(VisionQuant::parse("Mixed").unwrap(), VisionQuant::Mixed);
+        assert!(VisionQuant::parse("int4").is_err());
+
+        let attn = "model.visual.blocks.0.attn.qkv.weight";
+        let patch = "model.visual.patch_embed.proj.weight";
+        let merger = "model.visual.merger.linear_fc1.weight";
+        let norm = "model.visual.blocks.0.norm1.weight";
+        let bias = "model.visual.blocks.0.attn.qkv.bias";
+
+        // Default (F16) leaves every matrix alone.
+        assert_eq!(
+            vision_dtype_resolved(attn, 2, ""),
+            Some(VisionDtype::F16Matrix)
+        );
+        // i8 compresses all matrices, vectors stay F32.
+        assert_eq!(
+            vision_dtype_resolved(attn, 2, "i8"),
+            Some(VisionDtype::Q8Matrix)
+        );
+        assert_eq!(
+            vision_dtype_resolved(patch, 2, "i8"),
+            Some(VisionDtype::Q8Matrix)
+        );
+        assert_eq!(
+            vision_dtype_resolved(norm, 1, "i8"),
+            Some(VisionDtype::F32Vector)
+        );
+        assert_eq!(
+            vision_dtype_resolved(bias, 1, "i8"),
+            Some(VisionDtype::F32Vector)
+        );
+        // f8 selects the E4M3 container.
+        assert_eq!(
+            vision_dtype_resolved(attn, 2, "f8"),
+            Some(VisionDtype::E4M3Matrix)
+        );
+        // mixed keeps the tower ends at F16, compresses the body.
+        assert_eq!(
+            vision_dtype_resolved(attn, 2, "mixed"),
+            Some(VisionDtype::Q8Matrix)
+        );
+        assert_eq!(
+            vision_dtype_resolved(patch, 2, "mixed"),
+            Some(VisionDtype::F16Matrix)
+        );
+        assert_eq!(
+            vision_dtype_resolved(merger, 2, "mixed"),
+            Some(VisionDtype::F16Matrix)
+        );
+        // Outside the vision group nothing changes.
+        assert_eq!(
+            vision_dtype_resolved("model.language_model.layers.0.mlp.up.weight", 2, "i8"),
+            None
+        );
+        // A malformed value falls back to the historical F16 policy.
+        assert_eq!(
+            vision_dtype_resolved(attn, 2, "nonsense"),
+            Some(VisionDtype::F16Matrix)
         );
     }
 }

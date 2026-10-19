@@ -281,13 +281,90 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
                 .collect();
             gpu.upload_raw(&f16_bytes, &[n])
         }
+        3 | 27 => {
+            // Compressed 8-bit weight matrix (Q8F16 or E4M3F16). Two modes:
+            //  - HIPFIRE_VISION_I8/F8 set: upload the blocks as they are, so
+            //    VRAM holds 34 B per 32 weights instead of 64 B and the GEMM
+            //    expands each block in-register.
+            //  - default (OFF): widen to F16 at load, which is the historical
+            //    behavior; a compressed sidecar still loads on every arch.
+            let expect = n.div_ceil(32) * 34;
+            if data.len() != expect {
+                panic!(
+                    "{name}: compressed vision payload {} B != expected {} B for {} elements",
+                    data.len(),
+                    expect,
+                    n
+                );
+            }
+            let keep_compressed = if info.quant_type == 3 {
+                gpu.flags.vision_i8
+            } else {
+                gpu.flags.vision_f8
+            };
+            if !keep_compressed {
+                let f32_data = if info.quant_type == 3 {
+                    dequant_q8f16_blocks(data, n)
+                } else {
+                    dequant_e4m3f16_blocks(data, n)
+                };
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                return gpu.upload_raw(&f16_bytes, &[n]);
+            }
+            let dtype = if info.quant_type == 3 {
+                DType::Q8_0
+            } else {
+                DType::E4M3F16
+            };
+            gpu.upload_encoded(data, &[n], dtype)
+        }
         other => {
             panic!(
                 "{name}: unsupported vision quant_type={other} \
-                 (expected F16=1, F32=2, HFQ4=6/7)"
+                 (expected F16=1, F32=2, HFQ4=6/7, Q8F16=3, E4M3F16=27)"
             )
         }
     }
+}
+
+/// Decode `[f16 scale][32 x i8]` blocks (the Q8F16 container) to F32.
+/// Used when a compressed vision sidecar is loaded without
+/// `HIPFIRE_VISION_I8`: the tower runs exactly as before, just from widened
+/// weights.
+fn dequant_q8f16_blocks(data: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    for blk in data.chunks_exact(34) {
+        let scale = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for &code in &blk[2..34] {
+            out.push(scale * (code as i8) as f32);
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// Decode `[f16 scale][32 x E4M3]` blocks (the E4M3F16 container) to F32.
+fn dequant_e4m3f16_blocks(data: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    for blk in data.chunks_exact(34) {
+        let scale = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for &byte in &blk[2..34] {
+            let sign = if byte >> 7 == 1 { -1.0f32 } else { 1.0 };
+            let e = ((byte >> 3) & 0xF) as i32;
+            let m = (byte & 7) as i32;
+            let v = if e == 0 {
+                m as f32 * 2f32.powi(-9)
+            } else {
+                2f32.powi(e - 7) * (1.0 + m as f32 / 8.0)
+            };
+            out.push(scale * sign * v);
+        }
+    }
+    out.truncate(n);
+    out
 }
 
 /// Dequantize HFQ4 blocks to F32, using actual group_size (128 or 256).
@@ -959,7 +1036,27 @@ fn linear_f16(
     n: usize,
 ) -> HipResult<GpuTensor> {
     let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
-    if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
+    if matches!(w.dtype, DType::Q8_0 | DType::E4M3F16) {
+        // Compressed vision weight (W8A16): the Q8_0 WMMA GEMM reads the 34 B
+        // blocks straight from VRAM and expands them in-register against the
+        // F16 activation. E4M3F16 shares the block stride and reaches this arm
+        // only once an FP8 kernel exists (feature-flagged off today), so the
+        // arm is gated to Q8_0 until then.
+        if w.dtype != DType::Q8_0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "vision: E4M3F16 weights need the FP8 GEMM (not wired yet);                  re-quantize with --vision-quant i8",
+            ));
+        }
+        if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
+            gpu.gemm_q8_0_wmma(w, x, &y, out_dim, in_dim, n)?;
+        } else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "vision: compressed weights require wave32 WMMA",
+            ));
+        }
+    } else if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
         gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
     } else {
         // GEMM: Y_t[out_dim, n] = W[out_dim, in_dim] @ X[n, in_dim]^T

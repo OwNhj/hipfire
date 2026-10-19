@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use std::path::Path;
 
 use crate::hfq::*;
@@ -11,7 +10,10 @@ use crate::pipeline_gguf::dequantize_hfq_q8f16;
 use crate::quant_e8::*;
 use crate::quant_fwht::*;
 
-pub(crate) fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -> Result<(), String> {
+pub(crate) fn build_deepseek4_dense_e8soa_overlay(
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(input)
         .map_err(|e| format!("open source HFQ {}: {e}", input.display()))?;
     if hfq.arch_id != 9 {
@@ -97,7 +99,8 @@ pub(crate) fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -
                 data: packed,
                 spilled_len: 0,
             });
-            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024).map_err(|e| format!("spill: {e}"))?;
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+                .map_err(|e| format!("spill: {e}"))?;
         }
     }
 
@@ -145,7 +148,10 @@ pub(crate) fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -
 /// `DeepseekV4::validate_mq2r_dspark_sidecar` requires, so the artifact is
 /// born valid instead of being patched afterwards by
 /// `scripts/reap/hfq_metadata_stamp.rs`.
-pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) -> Result<(), String> {
+pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
     let hfq = hipfire_runtime::hfq::HfqFile::open(input)
         .map_err(|e| format!("open source sidecar {}: {e}", input.display()))?;
     if hfq.arch_id != 9 {
@@ -215,7 +221,8 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) 
                 data: bytes,
                 spilled_len: 0,
             });
-            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024).map_err(|e| format!("spill: {e}"))?;
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+                .map_err(|e| format!("spill: {e}"))?;
             continue;
         }
 
@@ -239,7 +246,8 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) 
             data: packed,
             spilled_len: 0,
         });
-        maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024).map_err(|e| format!("spill: {e}"))?;
+        maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+            .map_err(|e| format!("spill: {e}"))?;
     }
 
     if n_conv == 0 {
@@ -283,6 +291,147 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) 
         src_b as f64 / 1_073_741_824.0,
         dst_b as f64 / 1_073_741_824.0,
         dst_b as f64 * 100.0 / src_b.max(1) as f64,
+    );
+    Ok(())
+}
+
+/// Re-encode an existing vision-tower sidecar (`*.hfq`, arch 5 family) with a
+/// compressed weight container.
+///
+/// Input is the sidecar itself, so no checkpoint is needed: the F16 matrices
+/// are decoded, re-encoded as Q8F16 (`VisionQuant::I8`) or E4M3F16
+/// (`VisionQuant::F8`), and every other tensor (norms, biases, the position
+/// table, and whatever `Mixed` keeps wide) is copied through byte-for-byte.
+/// The block stride (34 B per 32 weights) is identical for both containers, so
+/// one loader size check covers them.
+pub(crate) fn build_vision_quant_sidecar(
+    input: &Path,
+    output: &Path,
+    quant: hipfire_quantize::vision_sidecar::VisionQuant,
+) -> Result<(), String> {
+    use hipfire_quantize::float16::f16_to_f32;
+    use hipfire_quantize::vision_sidecar::{vision_dtype_for, VisionDtype};
+
+    let hfq = hipfire_runtime::hfq::HfqFile::open(input)
+        .map_err(|e| format!("open vision sidecar {}: {e}", input.display()))?;
+    let metadata_json = hfq.metadata_json.clone();
+    let arch_id = hfq.arch_id;
+
+    let spill_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut spill = TensorSpill::new(spill_dir).map_err(|e| format!("create tensor spill: {e}"))?;
+    let names: Vec<String> = hfq.tensors().iter().map(|t| t.name.clone()).collect();
+    let mut tensors: Vec<HfqTensor> = Vec::with_capacity(names.len());
+    let (mut n_conv, mut src_b, mut dst_b) = (0usize, 0u64, 0u64);
+
+    for name in &names {
+        let (info, bytes) = hfq
+            .tensor_data_vec(name)
+            .ok_or_else(|| format!("source sidecar missing tensor '{name}'"))?;
+        let shape = info.shape.clone();
+        let qt = info.quant_type;
+        let gs = info.group_size;
+
+        // Only rank-2 matrices the policy compresses, and only when they are
+        // still in a lossless container (F16 or F32) — a source that is already
+        // compressed is copied through untouched.
+        let target = vision_dtype_for(name, shape.len(), quant);
+        // The GEMM's row stride is `(K / 32) * 34`, an integer division. A
+        // reduction width that is not a multiple of 32 would make the encoder
+        // pad a partial block that the kernel then never indexes, so every row
+        // after the first shifts. Qwen3.5-VL's `mlp.linear_fc2` is K=4304
+        // (4304 = 32*134.5), so that family stays lossless.
+        let k_width = if shape.len() == 2 {
+            shape[1] as usize
+        } else {
+            0
+        };
+        let k_aligned = k_width > 0 && k_width % 32 == 0;
+        let compresses = matches!(
+            target,
+            Some(VisionDtype::Q8Matrix) | Some(VisionDtype::E4M3Matrix)
+        ) && shape.len() == 2
+            && k_aligned
+            && matches!(qt, 1 | 2);
+        if matches!(
+            target,
+            Some(VisionDtype::Q8Matrix) | Some(VisionDtype::E4M3Matrix)
+        ) && shape.len() == 2
+            && !k_aligned
+        {
+            eprintln!("  passthrough (K={k_width} not a multiple of 32): {name}");
+        }
+
+        if !compresses {
+            tensors.push(HfqTensor {
+                name: name.clone(),
+                quant_type: QuantType::from_u8(qt)
+                    .ok_or_else(|| format!("{name}: unknown source qt={qt}"))?,
+                shape,
+                group_size: gs,
+                data: bytes,
+                spilled_len: 0,
+            });
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+                .map_err(|e| format!("spill: {e}"))?;
+            continue;
+        }
+
+        let n: usize = shape.iter().map(|&s| s as usize).product();
+        let f32_data: Vec<f32> = match qt {
+            1 => bytes
+                .chunks_exact(2)
+                .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
+            _ => bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        };
+        if f32_data.len() != n {
+            return Err(format!(
+                "{name}: decoded {} elements, expected {n}",
+                f32_data.len()
+            ));
+        }
+        let compressed = match target {
+            Some(VisionDtype::E4M3Matrix) => crate::quant_q4::quantize_e4m3f16(&f32_data),
+            _ => crate::quant_q4::quantize_q8f16(&f32_data),
+        };
+        let want = n.div_ceil(32) * 34;
+        if compressed.len() != want {
+            return Err(format!(
+                "{name}: encoded {} B, expected {want} B",
+                compressed.len()
+            ));
+        }
+        src_b += bytes.len() as u64;
+        dst_b += compressed.len() as u64;
+        n_conv += 1;
+        tensors.push(HfqTensor {
+            name: name.clone(),
+            quant_type: match target {
+                Some(VisionDtype::E4M3Matrix) => QuantType::E4M3F16,
+                _ => QuantType::Q8F16,
+            },
+            shape,
+            group_size: 32,
+            data: compressed,
+            spilled_len: 0,
+        });
+        maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+            .map_err(|e| format!("spill: {e}"))?;
+    }
+
+    write_hfq(output, arch_id, &metadata_json, &tensors, Some(&mut spill))
+        .map_err(|e| format!("write {}: {e}", output.display()))?;
+    eprintln!(
+        "vision-quant {:?}: {n_conv} matrices re-encoded, {:.1} MiB -> {:.1} MiB (arch {arch_id})",
+        quant,
+        src_b as f64 / 1048576.0,
+        dst_b as f64 / 1048576.0
     );
     Ok(())
 }

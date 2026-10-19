@@ -47,6 +47,7 @@ impl QuantType {
             20 => Some(Self::MQ3G256Lloyd),
             21 => Some(Self::HFP4G32),
             24 => Some(Self::MFP4G32),
+            27 => Some(Self::E4M3F16),
             22 => Some(Self::TidI32),
             28 => Some(Self::PARO4G128),
             29 => Some(Self::PARO4G128T),
@@ -120,7 +121,10 @@ pub(crate) enum QuantType {
     // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
-    // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
+    // qt 27 taken by E4M3F16 (vision W8A16): 34 B per 32 elements, layout
+    // byte-identical to Q8F16 (qt=3) but with E4M3 codes instead of int8:
+    // [f16 scale (2B)][32 x E4M3]. scale = group_amax / 448.
+    E4M3F16 = 27,    // HFP8 E4M3 family, unit-scale-per-32 (was: reserved v2 slot)
     PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
     PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
@@ -274,8 +278,6 @@ pub(crate) enum QuantLevel {
 pub(crate) fn mq6v2_promote_supported(arch_id: u32) -> bool {
     matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8)
 }
-
-
 
 /// Extract layer index from a tensor name.
 /// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
@@ -698,7 +700,6 @@ fn write_hfq_to(
     tensors: &[HfqTensor],
     spill: Option<&mut TensorSpill>,
 ) -> std::io::Result<()> {
-
     let metadata_bytes = metadata_json.as_bytes();
 
     // Calculate offsets

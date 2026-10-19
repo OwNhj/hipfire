@@ -61,7 +61,8 @@ pub const SUPPORTED_DEVICE_ARCH: &str = "gfx1201";
 /// `EXPORT_WEIGHT_TAIL_PAD_BYTES`): kernels over-read past `buf.size()`.
 pub const EXPORT_WEIGHT_TAIL_PAD_BYTES: u64 = 64 * 1024;
 /// `SharedAllocation::representation_tag` of every owner.
-pub const DENSE_REPRESENTATION_TAG: &str = "qwen35-dense/typed-seal-v1/vmm-ro-posix-fd/min-granule/tail64k";
+pub const DENSE_REPRESENTATION_TAG: &str =
+    "qwen35-dense/typed-seal-v1/vmm-ro-posix-fd/min-granule/tail64k";
 /// `LayoutRecipe::schema` of the dense recipe.
 pub const DENSE_RECIPE_SCHEMA: &str = "hipfire.qwen35.dense.recipe.v1";
 
@@ -92,7 +93,10 @@ pub enum SharedWeightError {
     /// A HIP/allocator call failed.
     Hip { context: String, error: HipError },
     /// The primary failure plus failures observed while cleaning up after it.
-    Cleanup { cause: Box<SharedWeightError>, failures: Vec<String> },
+    Cleanup {
+        cause: Box<SharedWeightError>,
+        failures: Vec<String>,
+    },
 }
 
 impl SharedWeightError {
@@ -106,13 +110,19 @@ impl SharedWeightError {
         Self::Codec(msg.into())
     }
     fn hip(context: impl Into<String>, error: HipError) -> Self {
-        Self::Hip { context: context.into(), error }
+        Self::Hip {
+            context: context.into(),
+            error,
+        }
     }
     fn with_cleanup(self, failures: Vec<String>) -> Self {
         if failures.is_empty() {
             self
         } else {
-            Self::Cleanup { cause: Box::new(self), failures }
+            Self::Cleanup {
+                cause: Box::new(self),
+                failures,
+            }
         }
     }
 }
@@ -176,6 +186,9 @@ dtype_table! {
     MFP4G32 = 36, MFP4G32Lloyd = 37, MFP4G32P = 38, MFP4G32E8 = 39, MFP4G32E8SOA = 40,
     MFP3G32E8 = 41, MFP2G32E8 = 42, MFP4G32E8G128 = 43, HFQ2G256 = 44, HFQ2G128 = 45,
     TQ2G128 = 46, BQ1G128 = 47, HFQ6G256 = 48, ParoQ4G128 = 49, Raw = 50,
+    // 51: E4M3 (FP8) codes with an f16 scale per 32, same block stride as
+    // Q8_0. Emitted by `hipfire-quantize --vision-quant f8`.
+    E4M3F16 = 51,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> u8 {
@@ -254,7 +267,10 @@ fn delta_dims(c: &Qwen35Config) -> SwResult<([usize; 4], usize)> {
         .linear_num_value_heads
         .checked_mul(c.linear_value_head_dim)
         .ok_or_else(overflow)?;
-    Ok(([qkv, z, c.linear_num_value_heads, c.linear_num_value_heads], c.dim))
+    Ok((
+        [qkv, z, c.linear_num_value_heads, c.linear_num_value_heads],
+        c.dim,
+    ))
 }
 
 /// Resolve [`DenseRecipeFlags`] with the exact predicates `load.rs` uses
@@ -269,7 +285,12 @@ pub fn resolve_dense_flags(gpu: &Gpu, config: &Qwen35Config) -> SwResult<DenseRe
         a4_rms_fdiv_planes: gpu.a4_rms_fdiv_planes_wanted(),
         gdn_fold_gfx12: gpu.iu4_gdn_fold_active(dims, k),
         gdn_fold_gfx11: gpu.mq4v2_fold_betaalpha_active(
-            dims[0], dims[1], dims[2], dims[3], k, GFX11_FOLD_N,
+            dims[0],
+            dims[1],
+            dims[2],
+            dims[3],
+            k,
+            GFX11_FOLD_N,
         ),
         lm_head_f32: f16_lm_head_mode_from_config() == F16LmHeadMode::F32,
     })
@@ -301,13 +322,25 @@ fn recipe_fields(arch: &str, flags: &DenseRecipeFlags) -> CanonicalFields {
     let mut f = CanonicalFields::new();
     f.insert("arch".into(), fv_str(arch));
     f.insert("mq4v2_symmetric".into(), fv_bool(flags.mq4v2_symmetric));
-    f.insert("a4_rms_fdiv_planes".into(), fv_bool(flags.a4_rms_fdiv_planes));
+    f.insert(
+        "a4_rms_fdiv_planes".into(),
+        fv_bool(flags.a4_rms_fdiv_planes),
+    );
     f.insert("gdn_fold_gfx12".into(), fv_bool(flags.gdn_fold_gfx12));
     f.insert("gdn_fold_gfx11".into(), fv_bool(flags.gdn_fold_gfx11));
     f.insert("lm_head_f32".into(), fv_bool(flags.lm_head_f32));
-    f.insert("weight_tail_pad_bytes".into(), fv_u64(EXPORT_WEIGHT_TAIL_PAD_BYTES));
-    f.insert("export_granularity".into(), fv_str("hipMemAllocationGranularityMinimum"));
-    f.insert("representation_tag".into(), fv_str(DENSE_REPRESENTATION_TAG));
+    f.insert(
+        "weight_tail_pad_bytes".into(),
+        fv_u64(EXPORT_WEIGHT_TAIL_PAD_BYTES),
+    );
+    f.insert(
+        "export_granularity".into(),
+        fv_str("hipMemAllocationGranularityMinimum"),
+    );
+    f.insert(
+        "representation_tag".into(),
+        fv_str(DENSE_REPRESENTATION_TAG),
+    );
     f.insert(
         "load_transforms".into(),
         fv_str("reuse:qwen35.load:norm-bias+awq-rcp-planes+z-beta-alpha-fold"),
@@ -406,7 +439,10 @@ pub fn dense_config_fields(c: &Qwen35Config) -> CanonicalFields {
     u("n_kv_heads", c.n_kv_heads as u64);
     u("head_dim", c.head_dim as u64);
     u("rope_theta_bits", u64::from(c.rope_theta.to_bits()));
-    u("partial_rotary_factor_bits", u64::from(c.partial_rotary_factor.to_bits()));
+    u(
+        "partial_rotary_factor_bits",
+        u64::from(c.partial_rotary_factor.to_bits()),
+    );
     u("mrope_section_0", c.mrope_section[0] as u64);
     u("mrope_section_1", c.mrope_section[1] as u64);
     u("mrope_section_2", c.mrope_section[2] as u64);
@@ -419,7 +455,10 @@ pub fn dense_config_fields(c: &Qwen35Config) -> CanonicalFields {
     u("num_experts", c.num_experts as u64);
     u("num_experts_per_tok", c.num_experts_per_tok as u64);
     u("moe_intermediate_size", c.moe_intermediate_size as u64);
-    u("shared_expert_intermediate_size", c.shared_expert_intermediate_size as u64);
+    u(
+        "shared_expert_intermediate_size",
+        c.shared_expert_intermediate_size as u64,
+    );
     u("vram_budget_bytes", c.vram_budget_bytes);
     f.insert("is_vl_text".into(), fv_bool(c.is_vl_text));
     f.insert("mrope_interleaved".into(), fv_bool(c.mrope_interleaved));
@@ -447,12 +486,21 @@ pub fn dense_config_fields(c: &Qwen35Config) -> CanonicalFields {
 /// decoded flags and requires exact equality.
 pub fn manifest_config(config: &Qwen35Config, flags: &DenseRecipeFlags) -> CanonicalFields {
     let mut f = dense_config_fields(config);
-    f.insert("flag.mq4v2_symmetric".into(), fv_bool(flags.mq4v2_symmetric));
-    f.insert("flag.a4_rms_fdiv_planes".into(), fv_bool(flags.a4_rms_fdiv_planes));
+    f.insert(
+        "flag.mq4v2_symmetric".into(),
+        fv_bool(flags.mq4v2_symmetric),
+    );
+    f.insert(
+        "flag.a4_rms_fdiv_planes".into(),
+        fv_bool(flags.a4_rms_fdiv_planes),
+    );
     f.insert("flag.gdn_fold_gfx12".into(), fv_bool(flags.gdn_fold_gfx12));
     f.insert("flag.gdn_fold_gfx11".into(), fv_bool(flags.gdn_fold_gfx11));
     f.insert("flag.lm_head_f32".into(), fv_bool(flags.lm_head_f32));
-    f.insert("weight_tail_pad_bytes".into(), fv_u64(EXPORT_WEIGHT_TAIL_PAD_BYTES));
+    f.insert(
+        "weight_tail_pad_bytes".into(),
+        fv_u64(EXPORT_WEIGHT_TAIL_PAD_BYTES),
+    );
     f
 }
 
@@ -537,7 +585,9 @@ pub fn encode_dense_seal(flags: &DenseRecipeFlags, seal: &Qwen35RankSeal) -> SwR
         || seal.global_expert_dtypes.iter().any(|v| !v.is_empty())
         || seal.local_expert_descriptors.iter().any(|v| !v.is_empty())
     {
-        return Err(SharedWeightError::unsupported("MoE/pager/expert metadata in seal"));
+        return Err(SharedWeightError::unsupported(
+            "MoE/pager/expert metadata in seal",
+        ));
     }
     if seal.layer_seals.len() as u64 > MAX_LAYERS {
         return Err(SharedWeightError::codec("layer count exceeds bound"));
@@ -681,7 +731,11 @@ impl<'a> Dec<'a> {
         }
         let dtype = self.dtype()?;
         let byte_len = self.usize()?;
-        Ok(GpuTensorDescriptor { shape, dtype, byte_len })
+        Ok(GpuTensorDescriptor {
+            shape,
+            dtype,
+            byte_len,
+        })
     }
     fn lut<const N: usize>(&mut self) -> SwResult<Option<[u32; N]>> {
         match self.u8()? {
@@ -741,7 +795,9 @@ pub fn decode_dense_seal(bytes: &[u8]) -> SwResult<DenseSealMeta> {
     }
     let version = d.u32()?;
     if version != SEAL_VERSION {
-        return Err(SharedWeightError::codec(format!("unsupported seal version {version}")));
+        return Err(SharedWeightError::codec(format!(
+            "unsupported seal version {version}"
+        )));
     }
     let flags = DenseRecipeFlags {
         mq4v2_symmetric: d.bool()?,
@@ -858,8 +914,20 @@ fn push_weight<'a>(
     }
 }
 
-fn push_plain<'a>(out: &mut Vec<Entry<'a>>, role: String, d: &'a GpuTensorDescriptor, kind: &'static str) {
-    out.push(Entry { role, desc: d, weight: None, awq_of: None, alias_of: None, kind });
+fn push_plain<'a>(
+    out: &mut Vec<Entry<'a>>,
+    role: String,
+    d: &'a GpuTensorDescriptor,
+    kind: &'static str,
+) {
+    out.push(Entry {
+        role,
+        desc: d,
+        weight: None,
+        awq_of: None,
+        alias_of: None,
+        kind,
+    });
 }
 
 /// Every role of the seal in canonical traversal order (same names and order
@@ -982,7 +1050,12 @@ fn z_fold_rows(
     if !(flags.gdn_fold_gfx12 || flags.gdn_fold_gfx11) {
         return Ok(None);
     }
-    let all_mq4v2 = [wqkv.gpu_dtype, wz.gpu_dtype, w_beta.gpu_dtype, w_alpha.gpu_dtype] == [DType::MQ4G256V2; 4];
+    let all_mq4v2 = [
+        wqkv.gpu_dtype,
+        wz.gpu_dtype,
+        w_beta.gpu_dtype,
+        w_alpha.gpu_dtype,
+    ] == [DType::MQ4G256V2; 4];
     if !all_mq4v2 || [wz.k, w_beta.k, w_alpha.k] != [wqkv.k; 3] {
         return Ok(None);
     }
@@ -996,7 +1069,11 @@ fn z_fold_rows(
 
 /// Typed bytes of a projection's `.buf`: `m` packed rows (the folded row
 /// count for a folded Z, whose upload shape is `[rows * row_bytes]`).
-fn typed_weight_bytes(role: &str, w: &WeightTensorDescriptor, fold_rows: Option<usize>) -> SwResult<usize> {
+fn typed_weight_bytes(
+    role: &str,
+    w: &WeightTensorDescriptor,
+    fold_rows: Option<usize>,
+) -> SwResult<usize> {
     if w.row_stride == 0 {
         if let Some(rb) = row_bytes_checked(w.gpu_dtype, w.k) {
             let n = rb
@@ -1019,7 +1096,11 @@ fn typed_weight_bytes(role: &str, w: &WeightTensorDescriptor, fold_rows: Option<
 
 /// Typed bytes of an AWQ sidecar: `K x 3` f32 reciprocal planes (shape
 /// `[K, AWQ_RCP_ROWS]`) or the plain scale blob.
-fn typed_awq_bytes(role: &str, w: &WeightTensorDescriptor, d: &GpuTensorDescriptor) -> SwResult<usize> {
+fn typed_awq_bytes(
+    role: &str,
+    w: &WeightTensorDescriptor,
+    d: &GpuTensorDescriptor,
+) -> SwResult<usize> {
     if d.shape.as_slice() == [w.k, rdna_compute::gemv::AWQ_RCP_ROWS] {
         return w
             .k
@@ -1032,10 +1113,20 @@ fn typed_awq_bytes(role: &str, w: &WeightTensorDescriptor, d: &GpuTensorDescript
 /// Typed (semantic representation) bytes of every seal role, canonical order.
 /// A captured seal carries the accessible source size per role (the
 /// allocator may round it up); a normalized seal carries exactly this value.
-fn typed_lengths(seal: &Qwen35RankSeal, flags: &DenseRecipeFlags) -> SwResult<Vec<(String, usize)>> {
+fn typed_lengths(
+    seal: &Qwen35RankSeal,
+    flags: &DenseRecipeFlags,
+) -> SwResult<Vec<(String, usize)>> {
     let mut folded: HashMap<String, usize> = HashMap::new();
     for (i, layer) in seal.layer_seals.iter().enumerate() {
-        if let Qwen35LayerSeal::DeltaNet { wqkv, wz, w_alpha, w_beta, .. } = layer {
+        if let Qwen35LayerSeal::DeltaNet {
+            wqkv,
+            wz,
+            w_alpha,
+            w_beta,
+            ..
+        } = layer
+        {
             if let Some(rows) = z_fold_rows(flags, wqkv, wz, w_beta, w_alpha)? {
                 folded.insert(format!("layers.{i:04}.wz.buf"), rows);
             }
@@ -1071,7 +1162,10 @@ fn visit_weight_desc_mut(
 
 /// Visit every tensor descriptor of the seal by role (same names as
 /// [`seal_entries`]).
-fn for_each_desc_mut(seal: &mut Qwen35RankSeal, f: &mut dyn FnMut(String, &mut GpuTensorDescriptor)) {
+fn for_each_desc_mut(
+    seal: &mut Qwen35RankSeal,
+    f: &mut dyn FnMut(String, &mut GpuTensorDescriptor),
+) {
     f("token_embd".into(), &mut seal.token_embd);
     f("output_norm".into(), &mut seal.output_norm);
     visit_weight_desc_mut("output", &mut seal.output, f);
@@ -1152,7 +1246,9 @@ fn normalize_dense_seal(
     config: &Qwen35Config,
 ) -> SwResult<Qwen35RankSeal> {
     check_dense_config(config)?;
-    source.validate_dense().map_err(hip_err("typed dense seal"))?;
+    source
+        .validate_dense()
+        .map_err(hip_err("typed dense seal"))?;
     let lens = typed_lengths(source, flags)?;
     let entries = seal_entries(source);
     for ((role, typed), e) in lens.iter().zip(&entries) {
@@ -1201,7 +1297,10 @@ pub fn dense_typed_tensor_lengths(
 ) -> Result<BTreeMap<String, usize>, SharedWeightError> {
     let flags = resolve_dense_flags(gpu, config)?;
     let seal = normalized_seal_of(weights, config, &flags)?;
-    Ok(seal_entries(&seal).into_iter().map(|e| (e.role, e.desc.byte_len)).collect())
+    Ok(seal_entries(&seal)
+        .into_iter()
+        .map(|e| (e.role, e.desc.byte_len))
+        .collect())
 }
 
 /// Typed `elems`-wide F32 tensor; `d.byte_len` is its exact typed size.
@@ -1232,7 +1331,9 @@ fn check_weight(
 ) -> SwResult<()> {
     let bad = |msg: String| SharedWeightError::invalid(format!("{role}: {msg}"));
     if w.paro.is_some() {
-        return Err(SharedWeightError::unsupported(format!("{role}: Paro sidecar")));
+        return Err(SharedWeightError::unsupported(format!(
+            "{role}: Paro sidecar"
+        )));
     }
     if w.m != rule.m || w.k != rule.k {
         return Err(bad(format!(
@@ -1258,7 +1359,10 @@ fn check_weight(
     }
     if let Some(a) = &w.awq_scale {
         if !w.gpu_dtype.supports_awq_sidecar() {
-            return Err(bad(format!("{:?} cannot carry an AWQ sidecar", w.gpu_dtype)));
+            return Err(bad(format!(
+                "{:?} cannot carry an AWQ sidecar",
+                w.gpu_dtype
+            )));
         }
         let k4 = w.k.checked_mul(4);
         let k12 = w.k.checked_mul(12);
@@ -1310,18 +1414,27 @@ pub fn validate_dense_seal(
     if tok.byte_len == 0 {
         return Err(SharedWeightError::invalid("token_embd: empty"));
     }
-    if seal.embd_format == EmbeddingFormat::F32 && tok.byte_len != mul(mul(config.vocab_size, dim)?, 4)? {
-        return Err(SharedWeightError::invalid("token_embd: F32 table size != vocab*dim*4"));
+    if seal.embd_format == EmbeddingFormat::F32
+        && tok.byte_len != mul(mul(config.vocab_size, dim)?, 4)?
+    {
+        return Err(SharedWeightError::invalid(
+            "token_embd: F32 table size != vocab*dim*4",
+        ));
     }
     check_plain("output_norm", &seal.output_norm, dim)?;
     check_weight(
         "output",
         &seal.output,
-        &WeightRule { m: config.vocab_size, k: dim },
+        &WeightRule {
+            m: config.vocab_size,
+            k: dim,
+        },
         flags,
     )?;
     if seal.lm_head_aliases_embd && seal.output.buf.byte_len != tok.byte_len {
-        return Err(SharedWeightError::invalid("tied output.buf extent != token_embd extent"));
+        return Err(SharedWeightError::invalid(
+            "tied output.buf extent != token_embd extent",
+        ));
     }
 
     for (i, (layer, ty)) in seal.layer_seals.iter().zip(&config.layer_types).enumerate() {
@@ -1428,10 +1541,16 @@ fn build_view(e: &Entry<'_>) -> SwResult<WeightView> {
     let owner_id = e.alias_of.clone().unwrap_or_else(|| e.role.clone());
     let mut meta = CanonicalFields::new();
     meta.insert("kind".into(), fv_str(e.kind));
-    meta.insert("dtype_tag".into(), fv_u64(u64::from(dtype_tag(e.desc.dtype))));
+    meta.insert(
+        "dtype_tag".into(),
+        fv_u64(u64::from(dtype_tag(e.desc.dtype))),
+    );
     let (matrix, quant, companions) = if let Some(w) = e.weight {
         meta.insert("gpu_dtype".into(), fv_str(dtype_name(w.gpu_dtype)));
-        meta.insert("gpu_dtype_tag".into(), fv_u64(u64::from(dtype_tag(w.gpu_dtype))));
+        meta.insert(
+            "gpu_dtype_tag".into(),
+            fv_u64(u64::from(dtype_tag(w.gpu_dtype))),
+        );
         meta.insert("weight_m".into(), fv_u64(w.m as u64));
         meta.insert("weight_k".into(), fv_u64(w.k as u64));
         meta.insert("weight_row_stride".into(), fv_u64(w.row_stride as u64));
@@ -1461,10 +1580,23 @@ fn build_view(e: &Entry<'_>) -> SwResult<WeightView> {
         // Matrix view only when the effective row stride is known and the
         // rows fit the extent (the runtime validates `m * stride <= extent`);
         // m/k/row_stride are always carried in the metadata fields too.
-        let stride = if w.row_stride != 0 { Some(w.row_stride) } else { row_bytes_checked(w.gpu_dtype, w.k) };
+        let stride = if w.row_stride != 0 {
+            Some(w.row_stride)
+        } else {
+            row_bytes_checked(w.gpu_dtype, w.k)
+        };
         let matrix = stride
-            .filter(|&s| s != 0 && w.m != 0 && w.k != 0 && w.m.checked_mul(s).is_some_and(|n| n <= e.desc.byte_len))
-            .map(|s| MatrixDesc { m: w.m as u64, k: w.k as u64, row_stride_bytes: s as u64 });
+            .filter(|&s| {
+                s != 0
+                    && w.m != 0
+                    && w.k != 0
+                    && w.m.checked_mul(s).is_some_and(|n| n <= e.desc.byte_len)
+            })
+            .map(|s| MatrixDesc {
+                m: w.m as u64,
+                k: w.k as u64,
+                row_stride_bytes: s as u64,
+            });
         (matrix, quant, companions)
     } else {
         (None, None, BTreeMap::new())
@@ -1472,7 +1604,10 @@ fn build_view(e: &Entry<'_>) -> SwResult<WeightView> {
     if let Some((buf_role, w)) = &e.awq_of {
         meta.insert("awq_for".into(), fv_str(buf_role));
         meta.insert("awq_k".into(), fv_u64(w.k as u64));
-        meta.insert("awq_reciprocal_planes".into(), fv_bool(e.desc.byte_len == w.k * 12));
+        meta.insert(
+            "awq_reciprocal_planes".into(),
+            fv_bool(e.desc.byte_len == w.k * 12),
+        );
     }
     Ok(WeightView {
         role: e.role.clone(),
@@ -1633,7 +1768,9 @@ fn collect_records(weights: &Qwen35Weights, typed: &HashMap<String, usize>) -> S
         })
         .map_err(hip_err("typed dense traversal"))?;
     if !missing.is_empty() {
-        return Err(SharedWeightError::invalid(format!("live roles without a typed length: {missing:?}")));
+        return Err(SharedWeightError::invalid(format!(
+            "live roles without a typed length: {missing:?}"
+        )));
     }
     Ok(recs)
 }
@@ -1642,10 +1779,16 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
     let mut sorted: Vec<&Rec> = Vec::new();
     for r in recs.iter().filter(|r| !r.borrowed) {
         if r.host {
-            return Err(SharedWeightError::unsupported(format!("{}: host-mapped owner", r.role)));
+            return Err(SharedWeightError::unsupported(format!(
+                "{}: host-mapped owner",
+                r.role
+            )));
         }
         if r.ptr == 0 || r.size == 0 {
-            return Err(SharedWeightError::invalid(format!("{}: null/empty owner", r.role)));
+            return Err(SharedWeightError::invalid(format!(
+                "{}: null/empty owner",
+                r.role
+            )));
         }
         if r.size < r.typed {
             return Err(SharedWeightError::invalid(format!(
@@ -1654,7 +1797,10 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
             )));
         }
         if require_vmm && !r.vmm {
-            return Err(SharedWeightError::invalid(format!("{}: owner is not a VMM allocation", r.role)));
+            return Err(SharedWeightError::invalid(format!(
+                "{}: owner is not a VMM allocation",
+                r.role
+            )));
         }
         sorted.push(r);
     }
@@ -1674,7 +1820,10 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
     let mut aliases = Vec::new();
     for r in recs.iter().filter(|r| r.borrowed) {
         if r.ptr == 0 || r.size == 0 {
-            return Err(SharedWeightError::invalid(format!("{}: null/empty alias", r.role)));
+            return Err(SharedWeightError::invalid(format!(
+                "{}: null/empty alias",
+                r.role
+            )));
         }
         if r.size < r.typed {
             return Err(SharedWeightError::invalid(format!(
@@ -1737,7 +1886,10 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
 }
 
 fn typed_map_of_seal(seal: &Qwen35RankSeal) -> HashMap<String, usize> {
-    seal_entries(seal).into_iter().map(|e| (e.role, e.desc.byte_len)).collect()
+    seal_entries(seal)
+        .into_iter()
+        .map(|e| (e.role, e.desc.byte_len))
+        .collect()
 }
 
 /// Complete unique-owner/alias census via typed traversal (no pointer
@@ -1756,7 +1908,11 @@ pub fn census_dense_weights(
 
 /// Census equals the seal's role table: same roles/order, extents, shapes,
 /// dtypes and alias topology (catches any traversal/seal naming drift).
-fn check_census_matches_seal(recs: &[Rec], census: &DenseCensus, seal: &Qwen35RankSeal) -> SwResult<()> {
+fn check_census_matches_seal(
+    recs: &[Rec],
+    census: &DenseCensus,
+    seal: &Qwen35RankSeal,
+) -> SwResult<()> {
     let entries = seal_entries(seal);
     if entries.len() != recs.len() {
         return Err(SharedWeightError::invalid(format!(
@@ -1899,9 +2055,15 @@ fn take_weight(
     prefix: &str,
     out: &mut Vec<(String, GpuTensor)>,
 ) {
-    out.push((format!("{prefix}.buf"), std::mem::replace(&mut w.buf, empty_tensor())));
+    out.push((
+        format!("{prefix}.buf"),
+        std::mem::replace(&mut w.buf, empty_tensor()),
+    ));
     if let Some(a) = w.awq_scale.as_mut() {
-        out.push((format!("{prefix}.awq_scale"), std::mem::replace(a, empty_tensor())));
+        out.push((
+            format!("{prefix}.awq_scale"),
+            std::mem::replace(a, empty_tensor()),
+        ));
     }
     if let Some(p) = w.paro.as_mut() {
         if !p.is_alias {
@@ -1910,7 +2072,10 @@ fn take_weight(
                 ("theta", &mut p.theta),
                 ("channel_scales", &mut p.channel_scales),
             ] {
-                out.push((format!("{prefix}.paro.{n}"), std::mem::replace(t, empty_tensor())));
+                out.push((
+                    format!("{prefix}.paro.{n}"),
+                    std::mem::replace(t, empty_tensor()),
+                ));
             }
         }
     }
@@ -1944,14 +2109,20 @@ impl ExportedDenseWeights {
     /// the `Gpu` orphan table.
     pub fn free_gpu(self, gpu: &mut Gpu) -> SwResult<()> {
         let mut failures = Vec::new();
-        let Self { weights, allocation_fds, .. } = self;
+        let Self {
+            weights,
+            allocation_fds,
+            ..
+        } = self;
         drop(allocation_fds);
         release_all_weights(gpu, weights, &mut failures);
         if failures.is_empty() {
             Ok(())
         } else {
             Err(SharedWeightError::Cleanup {
-                cause: Box::new(SharedWeightError::invalid("exported dense weights teardown")),
+                cause: Box::new(SharedWeightError::invalid(
+                    "exported dense weights teardown",
+                )),
                 failures,
             })
         }
@@ -2008,7 +2179,11 @@ fn export_prepare(
     let recs = collect_records(weights, &typed_map_of_seal(&seal))?;
     let census = census_from_records(&recs, false)?;
     check_census_matches_seal(&recs, &census, &seal)?;
-    Ok(Prepared { flags, seal, census })
+    Ok(Prepared {
+        flags,
+        seal,
+        census,
+    })
 }
 
 /// Promote every unique owner to an exportable VMM allocation, one owner at a
@@ -2040,7 +2215,9 @@ fn export_promote(
     let mut stage_error: Option<SharedWeightError> = None;
 
     let traversal = weights.for_each_dense_tensor_mut(&mut |role, slot| {
-        let fail = |stage_error: &mut Option<SharedWeightError>, e: SharedWeightError| -> Result<(), HipError> {
+        let fail = |stage_error: &mut Option<SharedWeightError>,
+                    e: SharedWeightError|
+         -> Result<(), HipError> {
             *stage_error = Some(e);
             Err(HipError::new(0, "shared dense export aborted"))
         };
@@ -2048,7 +2225,9 @@ fn export_promote(
             let Some(&ptr) = new_ptr.get(owner) else {
                 return fail(
                     &mut stage_error,
-                    SharedWeightError::invalid(format!("{role}: alias visited before owner {owner}")),
+                    SharedWeightError::invalid(format!(
+                        "{role}: alias visited before owner {owner}"
+                    )),
                 );
             };
             // The rebound view spans the typed extent of the new owner.
@@ -2108,27 +2287,48 @@ fn export_promote(
                 );
             }
         };
-        let ExportedWeightAllocation { owner, fd, physical_bytes, logical_bytes, granularity } = exp;
-        let (physical, logical, gran) = (physical_bytes as u64, logical_bytes as u64, granularity as u64);
-        if let Err(e) = check_extents(role, physical, logical, gran)
-            .and_then(|()| {
-                if logical_bytes == typed_bytes && owner.buf.size() == logical_bytes && owner.buf.is_vmm_owner() {
-                    Ok(())
-                } else {
-                    Err(SharedWeightError::invalid(format!(
-                        "{role}: exported owner extent {} != typed {typed_bytes}",
-                        owner.buf.size()
-                    )))
-                }
-            })
-        {
+        let ExportedWeightAllocation {
+            owner,
+            fd,
+            physical_bytes,
+            logical_bytes,
+            granularity,
+        } = exp;
+        let (physical, logical, gran) = (
+            physical_bytes as u64,
+            logical_bytes as u64,
+            granularity as u64,
+        );
+        if let Err(e) = check_extents(role, physical, logical, gran).and_then(|()| {
+            if logical_bytes == typed_bytes
+                && owner.buf.size() == logical_bytes
+                && owner.buf.is_vmm_owner()
+            {
+                Ok(())
+            } else {
+                Err(SharedWeightError::invalid(format!(
+                    "{role}: exported owner extent {} != typed {typed_bytes}",
+                    owner.buf.size()
+                )))
+            }
+        }) {
             ctx.stranded.push((format!("{role}.exported"), owner));
             return fail(&mut stage_error, e);
         }
-        let typed = GpuTensor { buf: owner.buf, shape: slot.shape.clone(), dtype: slot.dtype };
+        let typed = GpuTensor {
+            buf: owner.buf,
+            shape: slot.shape.clone(),
+            dtype: slot.dtype,
+        };
         new_ptr.insert(role.to_owned(), typed.buf.as_ptr() as usize);
         let mut old = std::mem::replace(slot, typed);
-        ctx.promoted.push(Promoted { owner_id: role.to_owned(), fd, physical, logical, granularity: gran });
+        ctx.promoted.push(Promoted {
+            owner_id: role.to_owned(),
+            fd,
+            physical,
+            logical,
+            granularity: gran,
+        });
         if pending_aliases.get(role).copied().unwrap_or(0) == 0 {
             if let Err(e) = release_old(gpu, role, &mut old, ctx) {
                 return fail(&mut stage_error, e);
@@ -2145,14 +2345,21 @@ fn export_promote(
     }
     match traversal {
         Ok(()) => stage_error.map_or(Ok(()), Err),
-        Err(e) => Err(stage_error.unwrap_or_else(|| SharedWeightError::hip("typed export traversal", e))),
+        Err(e) => {
+            Err(stage_error.unwrap_or_else(|| SharedWeightError::hip("typed export traversal", e)))
+        }
     }
 }
 
 /// Release a promoted-away source. A synchronization failure leaves `old`
 /// intact (kept for cleanup); a free failure is terminal (descriptor already
 /// emptied by the primitive) and is reported without retry.
-fn release_old(gpu: &mut Gpu, owner: &str, old: &mut GpuTensor, ctx: &mut ExportCtx) -> SwResult<()> {
+fn release_old(
+    gpu: &mut Gpu,
+    owner: &str,
+    old: &mut GpuTensor,
+    ctx: &mut ExportCtx,
+) -> SwResult<()> {
     match gpu.release_weight_source_immediate(old) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -2160,7 +2367,10 @@ fn release_old(gpu: &mut Gpu, owner: &str, old: &mut GpuTensor, ctx: &mut Export
                 let preserved = std::mem::replace(old, empty_tensor());
                 ctx.stranded.push((format!("{owner}.source"), preserved));
             }
-            Err(SharedWeightError::hip(format!("release of promoted source {owner}"), e))
+            Err(SharedWeightError::hip(
+                format!("release of promoted source {owner}"),
+                e,
+            ))
         }
     }
 }
@@ -2204,8 +2414,12 @@ fn export_finish(
     let recs = collect_records(weights, &typed_map_of_seal(&prepared.seal))?;
     let census = census_from_records(&recs, true)?;
     check_census_matches_seal(&recs, &census, &prepared.seal)?;
-    if census.owners.len() != prepared.census.owners.len() || census.aliases != prepared.census.aliases {
-        return Err(SharedWeightError::invalid("owner/alias topology changed during promotion"));
+    if census.owners.len() != prepared.census.owners.len()
+        || census.aliases != prepared.census.aliases
+    {
+        return Err(SharedWeightError::invalid(
+            "owner/alias topology changed during promotion",
+        ));
     }
     if ctx.promoted.len() != census.owners.len() {
         return Err(SharedWeightError::invalid(format!(
@@ -2214,13 +2428,16 @@ fn export_finish(
             census.owners.len()
         )));
     }
-    ctx.promoted.sort_by(|a, b| a.owner_id.as_bytes().cmp(b.owner_id.as_bytes()));
+    ctx.promoted
+        .sort_by(|a, b| a.owner_id.as_bytes().cmp(b.owner_id.as_bytes()));
     let mut manifest = build_manifest(gpu, config, prepared, &ctx.promoted)?;
     manifest.canonicalize();
     manifest.validate().map_err(manifest_err("validate"))?;
     for (alloc, p) in manifest.allocations.iter().zip(&ctx.promoted) {
         if alloc.owner_id != p.owner_id {
-            return Err(SharedWeightError::invalid("canonical allocation order != FD order"));
+            return Err(SharedWeightError::invalid(
+                "canonical allocation order != FD order",
+            ));
         }
     }
     Ok((manifest, census))
@@ -2295,16 +2512,26 @@ fn plan_import(
     meta: DenseSealMeta,
 ) -> SwResult<ImportPlan> {
     if manifest.arch != DENSE_MANIFEST_ARCH {
-        return Err(SharedWeightError::invalid(format!("manifest arch {:?}", manifest.arch)));
+        return Err(SharedWeightError::invalid(format!(
+            "manifest arch {:?}",
+            manifest.arch
+        )));
     }
     if manifest.config != manifest_config(config, &meta.flags) {
-        return Err(SharedWeightError::invalid("manifest config differs from local Qwen35Config/flags"));
+        return Err(SharedWeightError::invalid(
+            "manifest config differs from local Qwen35Config/flags",
+        ));
     }
     if encode_dense_seal(&meta.flags, &meta.seal)? != manifest.dispatch_metadata {
-        return Err(SharedWeightError::invalid("dispatch metadata is not the canonical encoding of its seal"));
+        return Err(SharedWeightError::invalid(
+            "dispatch metadata is not the canonical encoding of its seal",
+        ));
     }
     if gpu.arch != SUPPORTED_DEVICE_ARCH {
-        return Err(SharedWeightError::unsupported(format!("device arch {}", gpu.arch)));
+        return Err(SharedWeightError::unsupported(format!(
+            "device arch {}",
+            gpu.arch
+        )));
     }
     let local = resolve_dense_flags(gpu, config)?;
     if local != meta.flags {
@@ -2359,7 +2586,12 @@ fn plan_import(
                 alloc.logical_bytes
             )));
         }
-        check_extents(owner_id, alloc.physical_bytes, alloc.logical_bytes, alloc.granularity)?;
+        check_extents(
+            owner_id,
+            alloc.physical_bytes,
+            alloc.logical_bytes,
+            alloc.granularity,
+        )?;
         let desc = ImportedWeightAllocationDesc {
             physical_bytes: to_usize(alloc.physical_bytes, "physical_bytes")?,
             logical_bytes: to_usize(alloc.logical_bytes, "logical_bytes")?,
@@ -2445,7 +2677,11 @@ fn import_inner(
                 }
                 mapped.insert(
                     owner_id.clone(),
-                    GpuTensor { buf: raw.buf, shape: desc.shape.clone(), dtype: desc.dtype },
+                    GpuTensor {
+                        buf: raw.buf,
+                        shape: desc.shape.clone(),
+                        dtype: desc.dtype,
+                    },
                 );
             }
             Err(e) => {
@@ -2493,7 +2729,9 @@ fn import_inner(
         let census = census_from_records(&recs, true)?;
         check_census_matches_seal(&recs, &census, &plan.meta.seal)?;
         if census.owners.len() != plan.owners.len() {
-            return Err(SharedWeightError::invalid("hydrated owner count != allocation count"));
+            return Err(SharedWeightError::invalid(
+                "hydrated owner count != allocation count",
+            ));
         }
         Ok(())
     })();
@@ -2561,10 +2799,21 @@ mod tests {
     }
 
     fn f32d(n: usize) -> GpuTensorDescriptor {
-        GpuTensorDescriptor { shape: vec![n], dtype: DType::F32, byte_len: n * 4 }
+        GpuTensorDescriptor {
+            shape: vec![n],
+            dtype: DType::F32,
+            byte_len: n * 4,
+        }
     }
 
-    fn wd(dtype: DType, m: usize, k: usize, extra_rows: usize, awq: bool, planes: bool) -> WeightTensorDescriptor {
+    fn wd(
+        dtype: DType,
+        m: usize,
+        k: usize,
+        extra_rows: usize,
+        awq: bool,
+        planes: bool,
+    ) -> WeightTensorDescriptor {
         let rb = dtype.row_bytes(k).expect("row bytes");
         let bytes = (m + extra_rows) * rb;
         WeightTensorDescriptor {
@@ -2572,7 +2821,11 @@ mod tests {
             m,
             k,
             row_stride: 0,
-            buf: GpuTensorDescriptor { shape: vec![bytes], dtype: DType::Raw, byte_len: bytes },
+            buf: GpuTensorDescriptor {
+                shape: vec![bytes],
+                dtype: DType::Raw,
+                byte_len: bytes,
+            },
             awq_scale: awq.then(|| GpuTensorDescriptor {
                 shape: if planes { vec![k, 3] } else { vec![k * 4] },
                 dtype: DType::Raw,
@@ -2682,7 +2935,10 @@ mod tests {
     fn codec_rejects_truncation_trailing_and_bad_tags() {
         let blob = encode_dense_seal(&flags(), &seal(&cfg(), false)).unwrap();
         for cut in 0..blob.len() {
-            assert!(decode_dense_seal(&blob[..cut]).is_err(), "prefix {cut} decoded");
+            assert!(
+                decode_dense_seal(&blob[..cut]).is_err(),
+                "prefix {cut} decoded"
+            );
         }
         let mut extra = blob.clone();
         extra.push(0);
@@ -2816,11 +3072,23 @@ mod tests {
 
     #[test]
     fn f32_semantic_extent_ignores_allocator_slack() {
-        let slack = GpuTensorDescriptor { shape: vec![48], dtype: DType::F32, byte_len: 256 };
+        let slack = GpuTensorDescriptor {
+            shape: vec![48],
+            dtype: DType::F32,
+            byte_len: 256,
+        };
         assert_eq!(generic_typed_bytes("a_log", &slack).unwrap(), 192);
         // A sealed (typed) descriptor never carries slack.
         assert!(check_plain("a_log", &slack, 48).is_err());
-        check_plain("a_log", &GpuTensorDescriptor { byte_len: 192, ..slack.clone() }, 48).unwrap();
+        check_plain(
+            "a_log",
+            &GpuTensorDescriptor {
+                byte_len: 192,
+                ..slack.clone()
+            },
+            48,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2828,15 +3096,19 @@ mod tests {
         let c = cfg();
         let (dims, _) = delta_dims(&c).unwrap();
         let rb = DType::MQ4G256V2.row_bytes(c.dim).unwrap();
-        let lens: HashMap<String, usize> =
-            typed_lengths(&seal(&c, false), &flags()).unwrap().into_iter().collect();
+        let lens: HashMap<String, usize> = typed_lengths(&seal(&c, false), &flags())
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(lens["layers.0000.wz.buf"], (dims[1] + 128) * rb);
         assert_eq!(lens["layers.0000.wqkv.buf"], dims[0] * rb);
         assert_eq!(lens["layers.0000.wqkv.awq_scale"], c.dim * 12);
         assert_eq!(lens["layers.0000.wz.awq_scale"], c.dim * 4);
         assert_eq!(lens["layers.0000.a_log"], dims[2] * 4);
-        let tied: HashMap<String, usize> =
-            typed_lengths(&seal(&c, true), &flags()).unwrap().into_iter().collect();
+        let tied: HashMap<String, usize> = typed_lengths(&seal(&c, true), &flags())
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(tied["output.buf"], tied["token_embd"]);
     }
 
@@ -2943,7 +3215,10 @@ mod tests {
         let mut slack = rec("token_embd", 0, 0x1000, 0x140, false);
         slack.typed = 0x100;
         let c = census_from_records(&[slack], false).unwrap();
-        assert_eq!((c.logical_bytes, c.source_bytes, c.source_slack_bytes), (0x100, 0x140, 0x40));
+        assert_eq!(
+            (c.logical_bytes, c.source_bytes, c.source_slack_bytes),
+            (0x100, 0x140, 0x40)
+        );
         // An accessible allocation shorter than its typed length is rejected.
         let mut short = rec("token_embd", 0, 0x1000, 0x100, false);
         short.typed = 0x101;
@@ -2975,20 +3250,38 @@ mod tests {
         let c = census_from_records(&ok, true).unwrap();
         assert_eq!(c.owners.len(), 2);
         assert_eq!(c.aliases[0].owner_id, "token_embd");
-        assert_eq!((c.aliases[0].byte_offset, c.aliases[0].byte_extent), (0, 0x100));
+        assert_eq!(
+            (c.aliases[0].byte_offset, c.aliases[0].byte_extent),
+            (0, 0x100)
+        );
         assert_eq!(c.logical_bytes, 0x110);
         assert_eq!(c.largest_owner_bytes, 0x100);
         assert_eq!(c.sorted_owner_ids(), vec!["output_norm", "token_embd"]);
 
-        let outside = vec![rec("a", 0, 0x1000, 0x100, false), rec("v", 1, 0x1080, 0x100, true)];
+        let outside = vec![
+            rec("a", 0, 0x1000, 0x100, false),
+            rec("v", 1, 0x1080, 0x100, true),
+        ];
         assert!(census_from_records(&outside, false).is_err());
-        let orphan = vec![rec("a", 0, 0x1000, 0x100, false), rec("v", 1, 0x500, 0x10, true)];
+        let orphan = vec![
+            rec("a", 0, 0x1000, 0x100, false),
+            rec("v", 1, 0x500, 0x10, true),
+        ];
         assert!(census_from_records(&orphan, false).is_err());
-        let before = vec![rec("v", 0, 0x1000, 0x10, true), rec("a", 1, 0x1000, 0x100, false)];
+        let before = vec![
+            rec("v", 0, 0x1000, 0x10, true),
+            rec("a", 1, 0x1000, 0x100, false),
+        ];
         assert!(census_from_records(&before, false).is_err());
-        let dup = vec![rec("a", 0, 0x1000, 0x100, false), rec("b", 1, 0x1000, 0x100, false)];
+        let dup = vec![
+            rec("a", 0, 0x1000, 0x100, false),
+            rec("b", 1, 0x1000, 0x100, false),
+        ];
         assert!(census_from_records(&dup, false).is_err());
-        let overlap = vec![rec("a", 0, 0x1000, 0x100, false), rec("b", 1, 0x1080, 0x100, false)];
+        let overlap = vec![
+            rec("a", 0, 0x1000, 0x100, false),
+            rec("b", 1, 0x1080, 0x100, false),
+        ];
         assert!(census_from_records(&overlap, false).is_err());
         let mut host = rec("h", 0, 0x1000, 0x100, false);
         host.host = true;
@@ -2997,7 +3290,10 @@ mod tests {
         not_vmm.vmm = false;
         assert!(census_from_records(&[not_vmm], true).is_err());
         // Offset alias is representable but cannot be hydrated.
-        let off = vec![rec("a", 0, 0x1000, 0x100, false), rec("v", 1, 0x1040, 0x40, true)];
+        let off = vec![
+            rec("a", 0, 0x1000, 0x100, false),
+            rec("v", 1, 0x1040, 0x40, true),
+        ];
         let c = census_from_records(&off, false).unwrap();
         assert_eq!(c.aliases[0].byte_offset, 0x40);
     }

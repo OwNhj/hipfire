@@ -673,7 +673,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1596
+**Count:** 1598
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2235,7 +2235,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_VERIFY_GRAPH_TREE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/tree_graph_bench.sh | developer |
 | `HIPFIRE_VERIFY_TAPE_COPY_BATCH` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_VERSION` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | harness |
+| `HIPFIRE_VISION_F8` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_VISION_FIXTURE` | crates/hipfire-generate/tests/vision_lifecycle_tests.rs | harness |
+| `HIPFIRE_VISION_I8` | crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_VISION_IMAGE` | crates/hipfire-generate/tests/vision_lifecycle_tests.rs | harness |
 | `HIPFIRE_VISION_LIFECYCLE_CHILD` | crates/hipfire-generate/tests/vision_lifecycle_tests.rs | harness |
 | `HIPFIRE_VISION_MODE` | crates/hipfire-config/src/lib.rs | stable |
