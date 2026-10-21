@@ -76,6 +76,13 @@ pub const KV_BACKEND_NAMES: &[&str] = &["legacy", "vmm"];
 pub const DEFAULT_KV_CHUNK_TOKENS: usize = 64;
 pub const DEFAULT_VMM_PHYSICAL_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
+/// Map the full `physical_cap` on the first KV write instead of growing the VMM
+/// prefix in 2 MB chunks. Off when `HIPFIRE_KV_LAZY_MAP=1`.
+fn physical_cap_eager_mapping() -> bool {
+    // Process-start knob; read once per launch path, not per token.
+    std::env::var("HIPFIRE_KV_LAZY_MAP").as_deref() != Ok("1")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvMapGrowth {
     pub offset_bytes: usize,
@@ -2213,6 +2220,17 @@ impl KvCache {
     ) -> HipResult<()> {
         let Some(fast_capacity) = self.fast_mapped_token_capacity()? else {
             return Ok(());
+        };
+        // Eager mapping: map the whole `physical_cap` on the first write instead
+        // of growing the VMM prefix lazily. Lazy growth only defers the cost -
+        // the reservation and the eventual mapping are both sized by the same
+        // `--max-seq`, so a later long prompt pays the identical bill, just at a
+        // worse moment (mid-request, one chunk at a time). Opt out with
+        // HIPFIRE_KV_LAZY_MAP=1 to keep the incremental behaviour.
+        let required_tokens = if physical_cap_eager_mapping() {
+            self.physical_cap
+        } else {
+            required_tokens
         };
         if required_tokens > self.physical_cap {
             return Err(hip_bridge::HipError::new(

@@ -1985,6 +1985,15 @@ impl ServeRuntime {
             )?;
             if let Some(selector) = self.speculation_override.as_deref() {
                 apply_speculation_selector(&mut params, selector)?;
+                // A CLI selector can turn DFlash back on after `load_params`
+                // saw a config-time `off`, so re-project the configured draft
+                // before the sidecar lookup. Without this a bare (non-registry)
+                // model path fails closed: "DFlash needs a draft model".
+                if let Some(draft) = crate::developer_dflash_draft(&resolved) {
+                    if !draft.is_empty() {
+                        params["draft"] = serde_json::json!(draft);
+                    }
+                }
                 // Registry draft for a final dflash/auto selector the
                 // config-time load_params could not see (`serve --spec dflash`).
                 resolve_dflash_sidecar(

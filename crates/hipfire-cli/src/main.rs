@@ -6544,6 +6544,11 @@ fn open_bench_engine(
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
     }
+    // A CLI selector can opt DFlash back on after `load_params` ran with a
+    // config-time `off`, so re-project the configured draft here. Without this
+    // the later sidecar resolution sees no draft and a bare (non-registry)
+    // model path fails closed with "DFlash needs a draft model".
+    project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).
     resolve_dflash_sidecar(
